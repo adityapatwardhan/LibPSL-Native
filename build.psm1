@@ -1,4 +1,4 @@
-# Copyright (c) Microsoft Corporation. All rights reserved.
+﻿# Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
 # On Unix paths is separated by colon
@@ -144,6 +144,7 @@ function Get-EnvironmentInformation
         $environment += @{'IsOpenSUSE42.1' = $Environment.IsOpenSUSE -and $LinuxInfo.VERSION_ID  -match '42.1'}
         $environment += @{'IsRedHatFamily' = $Environment.IsCentOS -or $Environment.IsFedora}
         $environment += @{'IsSUSEFamily' = $Environment.IsSLES -or $Environment.IsOpenSUSE}
+        $environment += @{'IsAlpine' = $LinuxInfo.ID -match 'alpine'}
 
         # Workaround for temporary LD_LIBRARY_PATH hack for Fedora 24
         # https://github.com/PowerShell/PowerShell/issues/2511
@@ -215,13 +216,39 @@ function Start-BuildNativeWindowsBinaries {
     if ($env:VS140COMNTOOLS -ne $null) {
         $vcPath = (Get-Item(Join-Path -Path "$env:VS140COMNTOOLS" -ChildPath '../../vc')).FullName
     }
+    Write-Verbose -Verbose "VCPath: $vcPath"
 
-    $alternateVCPath = (Get-ChildItem "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2017" -Filter "VC" -Directory -Recurse | Select-Object -First 1).FullName
+    $alternateVCPath = (Get-ChildItem "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2017" -Filter "VC" -Directory -Recurse).FullName
+    Write-Verbose -Verbose "alternateVCPath: $alternateVCPath"
 
-    $atlMfcIncludePath = Join-Path -Path $vcPath -ChildPath 'atlmfc/include'
+    $atlBaseFound = $false
+
+    if ($alternateVCPath) {
+        foreach($candidatePath in $alternateVCPath) {
+            Write-Verbose -Verbose "Looking under $candidatePath"
+            $atlMfcIncludePath = @(Get-ChildItem -Path $candidatePath -Recurse -Filter 'atlbase.h' -File)
+
+            $atlMfcIncludePath | ForEach-Object {
+                if($_.FullName.EndsWith('atlmfc\include\atlbase.h')) {
+                    Write-Verbose -Verbose "ATLF MFC found under $($_.FullName)"
+                    $atlBaseFound = $true
+                    break
+                }
+            }
+        }
+    } elseif ($vcPath) {
+        $atlMfcIncludePath = Join-Path -Path $vcPath -ChildPath 'atlmfc/include'
+        if(Test-Path -Path "$atlMfcIncludePath\atlbase.h") {
+            Write-Verbose -Verbose "ATLF MFC found under $atlMfcIncludePath\atlbase.h"
+            $atlBaseFound = $true
+        }
+    } else {
+        Write-Verbose -Verbose "PATH: $env:PATH"
+        throw "Visual Studio tools not found in PATH."
+    }
 
     # atlbase.h is included in the pwrshplugin project
-    if ((Test-Path -Path $atlMfcIncludePath\atlbase.h) -eq $false) {
+    if (-not $atlBaseFound) {
         throw "Could not find Visual Studio include file atlbase.h at $atlMfcIncludePath. Please ensure the optional feature 'Microsoft Foundation Classes for C++' is installed."
     }
 
@@ -235,7 +262,7 @@ function Start-BuildNativeWindowsBinaries {
         $vcvarsallbatPath = $vcvarsallbatPathVS2017
     }
 
-    if ((Test-Path -Path $vcvarsallbatPath) -eq $false) {
+    if ([string]::IsNullOrEmpty($vcvarsallbatPath) -or (Test-Path -Path $vcvarsallbatPath) -eq $false) {
         throw "Could not find Visual Studio vcvarsall.bat at $vcvarsallbatPath. Please ensure the optional feature 'Common Tools for Visual C++' is installed."
     }
 
@@ -365,7 +392,8 @@ cmd.exe /C cd /d "$location" "&" "$vcvarsallbatPath" "$Arch" "&" "$cmakePath" "$
 
 function Start-BuildNativeUnixBinaries {
     param (
-        [switch] $BuildLinuxArm
+        [switch] $BuildLinuxArm,
+        [switch] $BuildLinuxArm64
     )
 
     if (-not $Environment.IsLinux -and -not $Environment.IsMacOS) {
@@ -373,8 +401,8 @@ function Start-BuildNativeUnixBinaries {
         return
     }
 
-    if ($BuildLinuxArm -and -not $Environment.IsUbuntu) {
-        throw "Cross compiling for linux-arm is only supported on Ubuntu environment"
+    if (($BuildLinuxArm -or $BuildLinuxArm64) -and -not $Environment.IsUbuntu) {
+        throw "Cross compiling for linux-arm/linux-arm64 are only supported on Ubuntu environment"
     }
 
     # Verify we have all tools in place to do the build
@@ -385,6 +413,10 @@ function Start-BuildNativeUnixBinaries {
 
     if ($BuildLinuxArm) {
         foreach ($Dependency in 'arm-linux-gnueabihf-gcc', 'arm-linux-gnueabihf-g++') {
+            $precheck = $precheck -and (precheck $Dependency "Build dependency '$Dependency' not found. Run 'Start-PSBootstrap'.")
+        }
+    } elseif ($BuildLinuxArm64) {
+        foreach ($Dependency in 'aarch64-linux-gnu-gcc', 'aarch64-linux-gnu-g++') {
             $precheck = $precheck -and (precheck $Dependency "Build dependency '$Dependency' not found. Run 'Start-PSBootstrap'.")
         }
     }
@@ -411,6 +443,10 @@ function Start-BuildNativeUnixBinaries {
         Push-Location $Native
         if ($BuildLinuxArm) {
             Start-NativeExecution { cmake -DCMAKE_TOOLCHAIN_FILE="./arm.toolchain.cmake" . }
+            Start-NativeExecution { make -j }
+        }
+        elseif ($BuildLinuxArm64) {
+            Start-NativeExecution { cmake -DCMAKE_TOOLCHAIN_FILE="./arm64.toolchain.cmake" . }
             Start-NativeExecution { make -j }
         }
         else {
@@ -467,7 +503,19 @@ function Start-BuildPowerShellNativePackage
 
         [Parameter(Mandatory = $true)]
         [ValidateScript({Test-Path $_ -PathType Leaf})]
+        [string] $LinuxARM64ZipPath,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateScript({Test-Path $_ -PathType Leaf})]
+        [string] $LinuxAlpineZipPath,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateScript({Test-Path $_ -PathType Leaf})]
         [string] $macOSZipPath,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateScript({Test-Path $_ -PathType Leaf})]
+        [string] $psrpZipPath,
 
         [Parameter(Mandatory = $true)]
         [string] $NuGetOutputPath,
@@ -490,19 +538,25 @@ function Start-BuildPowerShellNativePackage
     $BinFolderARM64 = Join-Path $tempExtractionPath "ARM64"
     $BinFolderLinux = Join-Path $tempExtractionPath "Linux"
     $BinFolderLinuxARM = Join-Path $tempExtractionPath "LinuxARM"
+    $BinFolderLinuxARM64 = Join-Path $tempExtractionPath "LinuxARM64"
+    $BinFolderLinuxAlpine = Join-Path $tempExtractionPath "LinuxAlpine"
     $BinFolderMacOS = Join-Path $tempExtractionPath "MacOS"
+    $BinFolderPSRP = Join-Path $tempExtractionPath "PSRP"
 
     Expand-Archive -Path $WindowsX64ZipPath -DestinationPath $BinFolderX64 -Force
     Expand-Archive -Path $WindowsX86ZipPath -DestinationPath $BinFolderX86 -Force
     Expand-Archive -Path $WindowsARMZipPath -DestinationPath $BinFolderARM -Force
     Expand-Archive -Path $WindowsARM64ZipPath -DestinationPath $BinFolderARM64 -Force
     Expand-Archive -Path $LinuxZipPath -DestinationPath $BinFolderLinux -Force
+    Expand-Archive -Path $LinuxAlpineZipPath -DestinationPath $BinFolderLinuxAlpine -Force
     Expand-Archive -Path $LinuxARMZipPath -DestinationPath $BinFolderLinuxARM -Force
+    Expand-Archive -Path $LinuxARM64ZipPath -DestinationPath $BinFolderLinuxARM64 -Force
     Expand-Archive -Path $macOSZipPath -DestinationPath $BinFolderMacOS -Force
+    Expand-Archive -Path $psrpZipPath -DestinationPath $BinFolderPSRP -Force
 
     PlaceWindowsNativeBinaries -PackageRoot $PackageRoot -BinFolderX64 $BinFolderX64 -BinFolderX86 $BinFolderX86 -BinFolderARM $BinFolderARM -BinFolderARM64 $BinFolderARM64
 
-    PlaceUnixBinaries -PackageRoot $PackageRoot -BinFolderLinux $BinFolderLinux -BinFolderLinuxARM $BinFolderLinuxARM -BinFolderOSX $BinFolderMacOS
+    PlaceUnixBinaries -PackageRoot $PackageRoot -BinFolderLinux $BinFolderLinux -BinFolderLinuxARM $BinFolderLinuxARM -BinFolderLinuxARM64 $BinFolderLinuxARM64 -BinFolderOSX $BinFolderMacOS -BinFolderPSRP $BinFolderPSRP -BinFolderLinuxAlpine $BinFolderLinuxAlpine
 
     $Nuspec = @'
 <?xml version="1.0" encoding="utf-8"?>
@@ -515,8 +569,8 @@ function Start-BuildPowerShellNativePackage
         <requireLicenseAcceptance>true</requireLicenseAcceptance>
         <description>Native binaries for PowerShell Core</description>
             <projectUrl>https://github.com/PowerShell/PowerShell</projectUrl>
-            <iconUrl>https://github.com/PowerShell/PowerShell/blob/master/assets/Powershell_black_64.png</iconUrl>
-            <licenseUrl>https://github.com/PowerShell/PowerShell/blob/master/LICENSE.txt</licenseUrl>
+            <iconUrl>https://github.com/PowerShell/PowerShell/blob/master/assets/Powershell_black_64.png?raw=true</iconUrl>
+            <license type="expression">MIT</license>
             <tags>PowerShell</tags>
             <language>en-US</language>
             <copyright>© Microsoft Corporation. All rights reserved.</copyright>
@@ -569,16 +623,38 @@ function PlaceUnixBinaries
 
         [Parameter(Mandatory = $true)]
         [ValidateScript({Test-Path $_ -PathType Container})]
-        $BinFolderOSX
+        $BinFolderLinuxARM64,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateScript({Test-Path $_ -PathType Container})]
+        $BinFolderLinuxAlpine,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateScript({Test-Path $_ -PathType Container})]
+        $BinFolderOSX,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateScript({Test-Path $_ -PathType Container})]
+        $BinFolderPSRP
     )
 
     $RuntimePathLinux = New-Item -ItemType Directory -Path (Join-Path $PackageRoot -ChildPath 'runtimes/linux-x64/native') -Force
     $RuntimePathLinuxARM = New-Item -ItemType Directory -Path (Join-Path $PackageRoot -ChildPath 'runtimes/linux-arm/native') -Force
+    $RuntimePathLinuxARM64 = New-Item -ItemType Directory -Path (Join-Path $PackageRoot -ChildPath 'runtimes/linux-arm64/native') -Force
+    $RuntimePathLinuxAlpine = New-Item -ItemType Directory -Path (Join-Path $PackageRoot -ChildPath 'runtimes/linux-musl-x64/native') -Force
     $RuntimePathOSX = New-Item -ItemType Directory -Path (Join-Path $PackageRoot -ChildPath 'runtimes/osx/native') -Force
 
     Copy-Item "$BinFolderLinux\*" -Destination $RuntimePathLinux -Verbose
     Copy-Item "$BinFolderLinuxARM\*" -Destination $RuntimePathLinuxARM -Verbose
+    Copy-Item "$BinFolderLinuxARM64\*" -Destination $RuntimePathLinuxARM64 -Verbose
+    Copy-Item "$BinFolderLinuxAlpine\*" -Destination $RuntimePathLinuxAlpine -Verbose
     Copy-Item "$BinFolderOSX\*" -Destination $RuntimePathOSX -Verbose
+
+    ## LinuxARM is not supported by PSRP
+    Get-ChildItem -Recurse $BinFolderPSRP/*.dylib | ForEach-Object { Copy-Item $_.FullName -Destination $RuntimePathOSX -Verbose }
+    Get-ChildItem -Recurse $BinFolderPSRP/*.so | ForEach-Object { Copy-Item $_.FullName -Destination $RuntimePathLinux -Verbose }
+
+    Copy-Item $BinFolderPSRP/version.txt -Destination "$PackageRoot/PSRP_version.txt" -Verbose
 }
 
 <#
@@ -683,6 +759,7 @@ function Start-PSBuild {
                      "osx-x64",
                      "linux-x64",
                      "linux-arm",
+                     "linux-arm64",
                      "win-arm",
                      "win-arm64")]
         [string]$Runtime,
@@ -697,8 +774,8 @@ function Start-PSBuild {
         [string]$ReleaseTag
     )
 
-    if ($Runtime -eq "linux-arm" -and -not $Environment.IsUbuntu) {
-        throw "Cross compiling for linux-arm is only supported on Ubuntu environment"
+    if (($Runtime -eq "linux-arm" -or $Runtime -eq "linux-arm64") -and -not $Environment.IsUbuntu) {
+        throw "Cross compiling for linux-arm/linux-arm64 are only supported on Ubuntu environment"
     }
 
     if ("win-arm","win-arm64" -contains $Runtime -and -not $Environment.IsWindows) {
@@ -995,6 +1072,7 @@ function New-PSOptions {
                      "osx-x64",
                      "linux-x64",
                      "linux-arm",
+                     "linux-arm64",
                      "win-arm",
                      "win-arm64")]
         [string]$Runtime,
@@ -1818,6 +1896,7 @@ function Start-PSBootstrap {
         [switch]$NoSudo,
         [switch]$BuildWindowsNative,
         [switch]$BuildLinuxArm,
+        [switch]$BuildLinuxArm64,
         [switch]$Force
     )
 
@@ -1841,8 +1920,8 @@ function Start-PSBootstrap {
                 Pop-Location
             }
 
-            if ($BuildLinuxArm -and -not $Environment.IsUbuntu) {
-                Write-Error "Cross compiling for linux-arm is only supported on Ubuntu environment"
+            if (($BuildLinuxArm -or $BuildLinuxArm64) -and -not $Environment.IsUbuntu) {
+                Write-Error "Cross compiling for linux-arm/linux-arm64 are only supported on Ubuntu environment"
                 return
             }
 
@@ -1854,6 +1933,8 @@ function Start-PSBootstrap {
 
                 if ($BuildLinuxArm) {
                     $Deps += "gcc-arm-linux-gnueabihf", "g++-arm-linux-gnueabihf"
+                } elseif ($BuildLinuxArm64) {
+                    $Deps += "gcc-aarch64-linux-gnu", "g++-aarch64-linux-gnu"
                 }
 
                 # .NET Core required runtime libraries
@@ -1937,6 +2018,12 @@ function Start-PSBootstrap {
 
                 # Install patched version of curl
                 Start-NativeExecution { brew install curl --with-openssl --with-gssapi } -IgnoreExitcode
+            } elseif ($Environment.IsAlpine) {
+                $Deps += "build-base", "gcc", "abuild", "binutils", "git", "python", "bash", "cmake"
+
+                # Install dependencies
+                Start-NativeExecution { apk update }
+                Start-NativeExecution { apk add $Deps }
             }
 
             # Install [fpm](https://github.com/jordansissel/fpm) and [ronn](https://github.com/rtomayko/ronn)
@@ -2422,6 +2509,7 @@ function Start-CrossGen {
                      "osx-x64",
                      "linux-x64",
                      "linux-arm",
+                     "linux-arm64",
                      "win-arm",
                      "win-arm64")]
         [string]
@@ -2484,6 +2572,8 @@ function Start-CrossGen {
         }
     } elseif ($Runtime -eq "linux-arm") {
         throw "crossgen is not available for 'linux-arm'"
+    } elseif ($Runtime -eq "linux-arm64") {
+        throw "crossgen is not available for 'linux-arm64'"
     } elseif ($Environment.IsLinux) {
         "linux-x64"
     } elseif ($Environment.IsMacOS) {
